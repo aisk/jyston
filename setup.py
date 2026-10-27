@@ -16,8 +16,8 @@ BOLTFLAGS = "BOLTFLAGS" in os.environ
 
 NAME = os.environ.get("PYSTON_LITE_NAME", "pyston_lite")
 
-if not (3, 7) <= sys.version_info[:2] <= (3, 10):
-    raise Exception("%s currently only targets Python 3.7, 3.8, 3.9 and 3.10" % NAME)
+if not (3, 8) <= sys.version_info[:2] <= (3, 10):
+    raise Exception("%s currently only targets Python 3.8, 3.9 and 3.10" % NAME)
 
 def check_call(args, **kw):
     print("check_call", " ".join([repr(a) for a in args]), kw)
@@ -149,7 +149,7 @@ This is the package for Pyston "lite",  the JIT part of [Pyston](https://github.
 a faster implementation of Python. Pyston lite does not contain all of the
 optimizations of full Pyston, but it is still 10-25% faster on many workloads.
 
-Pyston lite is currently only available for Python 3.7-3.10
+Pyston lite is currently only available for Python 3.8-3.10
 """.strip()
 
 setup(name=NAME,

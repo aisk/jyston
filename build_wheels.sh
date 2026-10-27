@@ -10,7 +10,7 @@ make -C LuaJIT -j`nproc` install
 
 ln -sf luajit-2.1.0-beta3 /usr/local/bin/luajit
 
-for PYVER in cp37-cp37m cp38-cp38 cp39-cp39 cp310-cp310
+for PYVER in cp38-cp38 cp39-cp39 cp310-cp310
 do
     echo "#################################"
     echo "Building pyston_lite for ${PYVER}"

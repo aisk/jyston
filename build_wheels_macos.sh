@@ -12,7 +12,7 @@ python3.8 -m venv $ENV_DIR
 ${ENV_DIR}/bin/pip install cibuildwheel
 
 export CC=gcc-11
-export CIBW_BUILD="cp37-* cp38-* cp39-* cp310-*"
+export CIBW_BUILD="cp38-* cp39-* cp310-*"
 export CIBW_SKIP="*_i686 *musllinux*"
 export CIBW_BUILD_VERBOSITY=2
 export CIBW_ENVIRONMENT="MACOSX_DEPLOYMENT_TARGET=10.16"

@@ -9,12 +9,6 @@ extern "C" {
 #define PY_LOCAL_AGGRESSIVE
 #include "Python.h"
 
-#if defined(PYSTON_LITE) && PY_MAJOR_VERSION == 3 &&  PY_MINOR_VERSION == 7
-#include "internal/pystate.h"
-// make sure this points to the Pyston version of this file:
-#include "pycore_code.h"
-#include "compat37.h"
-#else
 #include "pycore_ceval.h"
 // make sure this points to the Pyston version of this file:
 #include "pycore_code.h"
@@ -26,7 +20,6 @@ extern "C" {
 #include "pycore_tupleobject.h"
 #else
 #include "pycore_tuple.h"
-#endif
 #endif
 
 #include "code.h"

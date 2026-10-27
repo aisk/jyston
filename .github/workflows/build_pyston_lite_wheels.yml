@@ -5,9 +5,9 @@ on: [workflow_dispatch]
 jobs:
   build_pyston_lite_wheels_macos:
     name: Building wheels on MacOS
-    runs-on: macos-11
+    runs-on: macos-15-intel
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: checkout submodules
         run: |
           git submodule update --init LuaJIT
@@ -23,15 +23,16 @@ jobs:
           PYSTON_LITE_NAME=pyston_lite make build_wheels_noclean
           PYSTON_LITE_NAME=pyston      make build_wheels_noclean
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v4
         with:
+          name: wheels-macos
           path: ./wheelhouse/
 
   build_pyston_lite_wheels_linux:
     name: Building wheels on Linux
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: checkout submodules
         run: |
           git submodule update --init LuaJIT
@@ -50,6 +51,7 @@ jobs:
           PYSTON_LITE_NAME=pyston_lite make build_wheels_noclean
           PYSTON_LITE_NAME=pyston      make build_wheels_noclean
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v4
         with:
+          name: wheels-linux
           path: ./wheelhouse/

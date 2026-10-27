@@ -273,64 +273,7 @@ function_code_fastcall(PyCodeObject *co, PyObject *const *args, Py_ssize_t nargs
 }
 #endif
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-static PyObject *
-__PyFunction_FastCallKeywords(PyObject *func, PyObject *const *stack,
-                             Py_ssize_t nargs, PyObject *kwnames)
-{
-    PyCodeObject *co = (PyCodeObject *)PyFunction_GET_CODE(func);
-    PyObject *globals = PyFunction_GET_GLOBALS(func);
-    PyObject *argdefs = PyFunction_GET_DEFAULTS(func);
-    PyObject *kwdefs, *closure, *name, *qualname;
-    PyObject **d;
-    Py_ssize_t nkwargs = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
-    Py_ssize_t nd;
-
-    assert(PyFunction_Check(func));
-    assert(nargs >= 0);
-    assert(kwnames == NULL || PyTuple_CheckExact(kwnames));
-    assert((nargs == 0 && nkwargs == 0) || stack != NULL);
-    /* kwnames must only contains str strings, no subclass, and all keys must
-       be unique */
-
-    if (co->co_kwonlyargcount == 0 && nkwargs == 0 &&
-        (co->co_flags & ~PyCF_MASK) == (CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE))
-    {
-        if (argdefs == NULL && co->co_argcount == nargs) {
-            return function_code_fastcall(co, stack, nargs, globals);
-        }
-        else if (nargs == 0 && argdefs != NULL
-                 && co->co_argcount == PyTuple_GET_SIZE(argdefs)) {
-            /* function called with no arguments, but all parameters have
-               a default value: use default values as arguments .*/
-            stack = &PyTuple_GET_ITEM(argdefs, 0);
-            return function_code_fastcall(co, stack, PyTuple_GET_SIZE(argdefs),
-                                          globals);
-        }
-    }
-
-    kwdefs = PyFunction_GET_KW_DEFAULTS(func);
-    closure = PyFunction_GET_CLOSURE(func);
-    name = ((PyFunctionObject *)func) -> func_name;
-    qualname = ((PyFunctionObject *)func) -> func_qualname;
-
-    if (argdefs != NULL) {
-        d = &PyTuple_GET_ITEM(argdefs, 0);
-        nd = PyTuple_GET_SIZE(argdefs);
-    }
-    else {
-        d = NULL;
-        nd = 0;
-    }
-    return _PyEval_EvalCodeWithName((PyObject*)co, globals, (PyObject *)NULL,
-                                    stack, nargs,
-                                    nkwargs ? &PyTuple_GET_ITEM(kwnames, 0) : NULL,
-                                    stack + nargs,
-                                    nkwargs, 1,
-                                    d, (int)nd, kwdefs,
-                                    closure, name, qualname);
-}
-#elif PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION <= 9
+#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION <= 9
 inline PyObject *
 _PyFunction_Vectorcall(PyObject *func, PyObject* const* stack,
                        size_t nargsf, PyObject *kwnames)
@@ -397,7 +340,6 @@ _PyFunction_Vectorcall(PyObject *func, PyObject* const* stack,
 }
 #endif
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
 static inline vectorcallfunc
 _PyVectorcall_FunctionFunction(PyObject *callable)
 {
@@ -431,7 +373,6 @@ _PyObject_VectorcallFunction(PyThreadState *tstate, PyObject *callable, PyObject
     return _Py_CheckFunctionResult(tstate, callable, res, NULL);
 #endif
 }
-#endif
 
 
 //Py_LOCAL_INLINE(PyObject *) _Py_HOT_FUNCTION
@@ -462,9 +403,7 @@ call_functionFunction(PyThreadState *tstate,
     Py_ssize_t nargs = oparg - nkwargs;
     PyObject **stack = (pp_stack) - nargs - nkwargs;
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-    x = __PyFunction_FastCallKeywords(func, stack, nargs, kwnames);
-#elif PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION <= 9
+#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION <= 9
     if (tstate->use_tracing) {
         x = trace_call_function(tstate, func, stack, nargs, kwnames);
     }

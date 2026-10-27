@@ -1,12 +1,8 @@
 #include "Python.h"
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-#include "internal/pystate.h"
-#else
 #include "pycore_object.h"
 #include "pycore_pyerrors.h"
 #include "pycore_pystate.h"
-#endif
 
 #if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 9
 #include "internal/pycore_call.h"
@@ -187,10 +183,6 @@ PyObject* module_getattro_not_found(PyObject *_m, PyObject *name)
 
         mod_name = _PyDict_GetItemId(m->md_dict, &PyId___name__);
         if (mod_name && PyUnicode_Check(mod_name)) {
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-            PyErr_Format(PyExc_AttributeError,
-                        "module '%U' has no attribute '%U'", mod_name, name);
-#else
             _Py_IDENTIFIER(__spec__);
             Py_INCREF(mod_name);
             PyObject *spec = _PyDict_GetItemId(m->md_dict, &PyId___spec__);
@@ -209,7 +201,6 @@ PyObject* module_getattro_not_found(PyObject *_m, PyObject *name)
             }
             Py_XDECREF(spec);
             Py_DECREF(mod_name);
-#endif
             return NULL;
         }
 #else
@@ -607,14 +598,12 @@ _process_method(PyObject* self, PyObject* res, int* unbound) {
         return NULL;
     }
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
     if (PyType_HasFeature(Py_TYPE(res), Py_TPFLAGS_METHOD_DESCRIPTOR)) {
         /* Avoid temporary PyMethodObject */
         *unbound = 1;
         Py_INCREF(res);
     }
     else
-#endif
     {
         *unbound = 0;
         descrgetfunc f = Py_TYPE(res)->tp_descr_get;

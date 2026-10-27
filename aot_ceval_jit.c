@@ -104,12 +104,7 @@
 // on 3.8:
 //   manual_stack_slots | deferred_stack
 #define NUM_MANUAL_STACK_SLOTS   2 /* used by STORE_SUBSCR */
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-#define DEFERRED_STACK_SLOT_START (NUM_MANUAL_STACK_SLOTS + 1)
-#define WHY_SLOT NUM_MANUAL_STACK_SLOTS
-#else
 #define DEFERRED_STACK_SLOT_START NUM_MANUAL_STACK_SLOTS
-#endif
 
 typedef enum ValueStackLoc {
     CONST,
@@ -294,7 +289,6 @@ void format_exc_unbound(PyThreadState *tstate, PyCodeObject *co, int oparg);
 #ifdef PYSTON_LITE
 void* lookdict_split_value;
 #define lookdict_split lookdict_split_value
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
 static void* method_vectorcall_NOARGS_value;
 static void* method_vectorcall_O_value;
 static void* method_vectorcall_FASTCALL_value;
@@ -307,7 +301,6 @@ static void* method_vectorcall_VARARGS_KEYWORDS_value;
 #define method_vectorcall_FASTCALL_KEYWORDS method_vectorcall_FASTCALL_KEYWORDS_value
 #define method_vectorcall_VARARGS method_vectorcall_VARARGS_value
 #define method_vectorcall_VARARGS_KEYWORDS method_vectorcall_VARARGS_KEYWORDS_value
-#endif
 #else
 Py_ssize_t lookdict_split(PyDictObject *mp, PyObject *key, Py_hash_t hash, PyObject **value_addr);
 PyObject * method_vectorcall_NOARGS(PyObject *func, PyObject *const *args, size_t nargsf, PyObject *kwnames);
@@ -379,9 +372,7 @@ static void* __attribute__ ((const)) get_addr_of_helper_func(int opcode, int opa
         JIT_HELPER_ADDR(POP_FINALLY);
 #endif
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
         JIT_HELPER_ADDR(END_ASYNC_FOR);
-#endif
 
 #if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 9
         JIT_HELPER_ADDR(WITH_EXCEPT_START);
@@ -639,10 +630,6 @@ static const char* get_opcode_name(int opcode) {
         OPCODE_NAME(LOAD_METHOD);
         OPCODE_NAME(CALL_METHOD);
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-        OPCODE_NAME(CONTINUE_LOOP);
-        OPCODE_NAME(BREAK_LOOP);
-#endif
 
 #if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 8
         OPCODE_NAME(BEGIN_FINALLY);
@@ -650,10 +637,8 @@ static const char* get_opcode_name(int opcode) {
         OPCODE_NAME(POP_FINALLY);
 #endif
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
         OPCODE_NAME(ROT_FOUR);
         OPCODE_NAME(END_ASYNC_FOR);
-#endif
 
 #if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION <= 8
         OPCODE_NAME(WITH_CLEANUP_START);
@@ -736,20 +721,11 @@ static char* calculate_jmp_targets(Jit* Dst) {
                 is_jmp_target[oparg/INST_IDX_TO_LASTI_FACTOR] = 1;
                 break;
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-            case BREAK_LOOP:
-            case CONTINUE_LOOP:
-                is_jmp_target[inst_idx + 1] = 1;
-                is_jmp_target[oparg/INST_IDX_TO_LASTI_FACTOR] = 1;
-                break;
-#endif
 
 
             case JUMP_FORWARD:
             case FOR_ITER:
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
             case END_ASYNC_FOR:
-#endif
                 is_jmp_target[oparg/INST_IDX_TO_LASTI_FACTOR + inst_idx + 1] = 1;
                 break;
 
@@ -764,10 +740,6 @@ static char* calculate_jmp_targets(Jit* Dst) {
             case SETUP_ASYNC_WITH:
             case SETUP_FINALLY:
             case SETUP_WITH:
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-            case SETUP_LOOP:
-            case SETUP_EXCEPT:
-#endif
                 is_jmp_target[inst_idx + 1] = 1;
                 is_jmp_target[oparg/INST_IDX_TO_LASTI_FACTOR + inst_idx + 1] = 1;
                 break;
@@ -2360,12 +2332,6 @@ static void emit_jump_if_true(Jit* Dst, int oparg, RefStatus ref_status, int gen
     // continue here
 }
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-static void emit_set_why(Jit* Dst, enum why_code why) {
-    emit_load64_mem(Dst, tmp_idx, sp_reg_idx, WHY_SLOT * 8);
-    emit_store32_mem_imm(Dst, why, tmp_idx, 0 /*=offset*/);
-}
-#endif
 
 #if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 10
 void emit_set_f_state(Jit* Dst, int value) {
@@ -2381,9 +2347,6 @@ void emit_set_f_stackdepth(Jit* Dst, int value) {
 
 static void emit_exit_yielding_label(Jit* Dst) {
     |->exit_yielding:
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-    emit_set_why(Dst, WHY_YIELD);
-#endif
     // to differentiate from a normal return we set the second lowest bit
 @ARM| orr real_res, res, #2
 @X86| or real_res, 2
@@ -3502,9 +3465,7 @@ static void emit_instr_start(Jit* Dst, int inst_idx, int opcode, int oparg) {
         case EXTENDED_ARG:
         case ROT_TWO:
         case ROT_THREE:
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
         case ROT_FOUR:
-#endif
         case POP_TOP:
         case DUP_TOP:
         case DUP_TOP_TWO:
@@ -3911,7 +3872,6 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
             }
             break;
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
         case ROT_FOUR:
             if (Dst->deferred_vs_next >= 4) {
                 DeferredValueStackEntry tmp[4];
@@ -3932,7 +3892,6 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
                 emit_write_vs(Dst, res_idx, 1 /*=top*/);
             }
             break;
-#endif
 
         case DUP_TOP:
             if (Dst->deferred_vs_next >= 1 && Dst->deferred_vs_next + 1 < DEFERRED_VS_MAX &&
@@ -3969,9 +3928,7 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
         case RETURN_VALUE:
             deferred_vs_pop1_owned(Dst, res_idx);
             deferred_vs_apply(Dst);
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-            emit_set_why(Dst, WHY_RETURN);
-#elif PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 10
+#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 10
             // f->f_state = FRAME_RETURNED;
             emit_set_f_state(Dst, FRAME_RETURNED);
             // f->f_stackdepth = 0;
@@ -4124,7 +4081,6 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
                     int num_args = oparg + hint->meth_found; // number of arguments to the function, including a potential "self"
                     int num_vs_args = num_args + 1; // number of python values; one more than the number of arguments since it includes the callable
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
                     if (hint->attr->ob_type == &PyMethodDescr_Type) {
                         PyMethodDescrObject* method = (PyMethodDescrObject*)hint->attr;
                         void* funcptr = method->d_method->ml_meth;
@@ -4248,7 +4204,6 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
                             emit_if_res_0_error(Dst);
                         }
                     }
-#endif
                 }
 
                 if (hint)
@@ -4413,19 +4368,6 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
 #if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION <= 8
         case END_FINALLY:
         {
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-            deferred_vs_apply(Dst);
-            emit_load64_mem(Dst, arg1_idx, sp_reg_idx, NUM_MANUAL_STACK_SLOTS * 8);
-            emit_call_ext_func(Dst, JIT_HELPER_END_FINALLY37);
-            emit_if_res_0_error(Dst);
-            emit_cmp64_imm(Dst, res_idx, 1);
-            | branch_eq >1
-@ARM        | and res, res, #~3 // clear 'goto_fast_block_end' flag
-@X86        | and res, ~3 // clear 'goto_fast_block_end' flag
-            | branch ->exception_unwind
-            exception_unwind_label_used = 1;
-            |1:
-#else
             RefStatus ref_status = OWNED;
             deferred_vs_pop1_owned(Dst, arg1_idx);
             deferred_vs_apply(Dst);
@@ -4456,7 +4398,6 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
                 exception_unwind_label_used = 1;
                 switch_section(Dst, SECTION_CODE);
             }
-#endif
             break;
         }
 #endif
@@ -4484,18 +4425,10 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
         case MAP_ADD:
         {
             RefStatus ref_status[2];
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-            deferred_vs_pop2(Dst, arg2_idx, arg3_idx, ref_status);
-#else
             deferred_vs_pop2(Dst, arg3_idx, arg2_idx, ref_status);
-#endif
             deferred_vs_peek(Dst, arg1_idx, oparg);
             deferred_vs_convert_reg_to_stack(Dst);
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-            emit_call_decref_args2(Dst, PyDict_SetItem, arg2_idx, arg3_idx, ref_status);
-#else
             emit_call_decref_args2(Dst, PyDict_SetItem, arg3_idx, arg2_idx, ref_status);
-#endif
             emit_if_res_32b_not_0_error(Dst);
             break;
         }
@@ -4660,22 +4593,12 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
             }
             break;
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-        case SETUP_LOOP:
-        case SETUP_EXCEPT:
-#endif
         case SETUP_FINALLY:
         case SETUP_ASYNC_WITH:
             deferred_vs_apply(Dst);
             // PyFrame_BlockSetup(f, SETUP_FINALLY, INSTR_OFFSET() + oparg, STACK_LEVEL());
             | mov arg1, f
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-            if (opcode == SETUP_LOOP || opcode == SETUP_EXCEPT) {
-                emit_mov_imm(Dst, arg2_idx, opcode);
-            } else {
-#else
             {
-#endif
                 emit_mov_imm(Dst, arg2_idx, SETUP_FINALLY);
             }
             emit_mov_imm(Dst, arg3_idx, (inst_idx + 1) * INST_IDX_TO_LASTI_FACTOR + oparg);
@@ -4705,14 +4628,9 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
             break;
 
         case POP_BLOCK:
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-            deferred_vs_apply(Dst);
-            emit_call_ext_func(Dst, JIT_HELPER_POP_BLOCK37);
-#else
             deferred_vs_convert_reg_to_stack(Dst);
             | mov arg1, f
             emit_call_ext_func(Dst, PyFrame_BlockPop);
-#endif
             break;
 
 #if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 8
@@ -4761,27 +4679,6 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
             }
             break;
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-        case BREAK_LOOP:
-            deferred_vs_apply(Dst);
-            emit_set_why(Dst, WHY_BREAK);
-            //goto fast_block_end;
-            emit_mov_imm(Dst, res_idx, 0);
-            exception_unwind_label_used = 1;
-            | branch ->exception_unwind
-            break;
-
-        case CONTINUE_LOOP:
-            deferred_vs_apply(Dst);
-            emit_mov_imm(Dst, arg1_idx, oparg);
-            emit_call_ext_func(Dst, PyLong_FromLong);
-            emit_if_res_0_error(Dst);
-            emit_set_why(Dst, WHY_CONTINUE);
-            //goto fast_block_end;
-            exception_unwind_label_used = 1;
-            | branch ->exception_unwind
-            break;
-#endif
 
 
 #if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 9
@@ -4955,9 +4852,7 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
                 case GET_AITER:
                 case GET_AWAITABLE:
                 case YIELD_FROM:
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
                 case END_ASYNC_FOR:
-#endif
                 case UNPACK_SEQUENCE:
                 case UNPACK_EX:
                 case IMPORT_STAR:
@@ -5146,14 +5041,9 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
                     // res == 2 means goto exception_unwind
                     emit_if_res_0_error(Dst);
                     exception_unwind_label_used = 1;
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-                    emit_set_why(Dst, WHY_EXCEPTION);
-                    emit_mov_imm(Dst, res_idx, 0);
-#endif
                     | branch ->exception_unwind
                     break;
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
                 case END_ASYNC_FOR:
                     // res == 1 means JUMP_BY(oparg) (only other value)
                     // res == 2 means goto exception_unwind
@@ -5162,7 +5052,6 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
                     exception_unwind_label_used = 1;
                     emit_jump_by_n_bytecodes(Dst, oparg, inst_idx);
                     break;
-#endif
 
                 // opcodes helper functions which return the result instead of pushing to the value stack
                 case GET_AITER:
@@ -5287,13 +5176,7 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
 
     if (exception_unwind_label_used) {
         |->exception_unwind:
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-@ARM    | orr real_res, res, #1
-@X86    | mov real_res, res
-@X86    | or real_res, 1
-#else
         emit_mov_imm(Dst, real_res_idx, 1);
-#endif
         | branch ->return
     }
 
@@ -5408,9 +5291,6 @@ void* jit_func(PyCodeObject* co, PyThreadState* tstate) {
 @ARM| sub sp, sp, #(num_callee_saved+num_stack_slots)*8
 @X86| sub rsp, num_stack_slots*8
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-    emit_store64_mem(Dst, arg4_idx /* =value */, sp_reg_idx, WHY_SLOT * 8);
-#endif
 
     // We store the address of _PyRuntime.ceval.tracing_possible and eval_breaker inside a register
     // this makes it possible to compare this two 4 byte variables at the same time to 0
@@ -5814,11 +5694,6 @@ void jit_start() {
 
 #ifdef PYSTON_LITE
     // This is to get the value of lookdict_split, which is a static function:
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 7
-    PyDictKeysObject* tmp_keys = _PyDict_NewKeysForClass();
-    lookdict_split_value = tmp_keys->dk_lookup;
-    // Unfortunately I can't find an easy way to deallocate this temporary object.
-#else
     PyDictObject* tmp_dict = (PyDictObject*)PyDict_New();
     if (!_PyDict_HasSplitTable(tmp_dict)) {
         fprintf(stderr, "pyston_lite: could not retrieve pointer to lookdict_split\n");
@@ -5826,9 +5701,7 @@ void jit_start() {
     }
     lookdict_split_value = tmp_dict->ma_keys->dk_lookup;
     Py_DECREF(tmp_dict);
-#endif
 
-#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 8
     // To get the values of these functions we have to find methods that use them, and then fish the value out:
     method_vectorcall_NOARGS_value = ((PyMethodDescrObject*)PyDict_GetItemString(PyList_Type.tp_dict, "clear"))->vectorcall;
     method_vectorcall_O_value = ((PyMethodDescrObject*)PyDict_GetItemString(PyList_Type.tp_dict, "append"))->vectorcall;
@@ -5836,7 +5709,6 @@ void jit_start() {
     method_vectorcall_FASTCALL_KEYWORDS_value = ((PyMethodDescrObject*)PyDict_GetItemString(PyList_Type.tp_dict, "sort"))->vectorcall;
     method_vectorcall_VARARGS_value = ((PyMethodDescrObject*)PyDict_GetItemString(PyBytes_Type.tp_dict, "count"))->vectorcall;
     method_vectorcall_VARARGS_KEYWORDS_value = ((PyMethodDescrObject*)PyDict_GetItemString(PyUnicode_Type.tp_dict, "format"))->vectorcall;
-#endif
 #endif
 }
 
