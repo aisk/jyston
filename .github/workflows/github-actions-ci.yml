@@ -10,9 +10,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: install dependencies
+        run: sudo apt-get update && sudo apt-get install -y luajit
       - name: build and test
         run: PYTHON=python make test
 

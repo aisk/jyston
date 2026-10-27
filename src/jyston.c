@@ -13,23 +13,11 @@
  * _PyInterpreterFrame and hands the frame to the CPython interpreter, which
  * resumes execution at that instruction.
  *
- * There is no code generation yet: every compiled function deopts at its first
- * instruction.
+ * Code generation lives in jit_x86_64.dasc, the runtime support for jitted
+ * code in jit_runtime.c.
  */
 
-#define Py_BUILD_CORE_MODULE 1
-#include "Python.h"
-
-#if PY_VERSION_HEX < 0x030F0000 || PY_VERSION_HEX >= 0x03100000
-#error "jyston only supports CPython 3.15"
-#endif
-
-#include "internal/pycore_ceval.h"
-#include "internal/pycore_code.h"
-#include "internal/pycore_function.h"
-#include "internal/pycore_frame.h"
-#include "internal/pycore_interpframe.h"
-#include "internal/pycore_stackref.h"
+#include "jit.h"
 
 #define DEFAULT_JIT_THRESHOLD 100
 
@@ -38,22 +26,6 @@ enum {
     JY_COMPILED = 1,
     JY_REJECTED = 2,
 };
-
-/* Per code object state, stored in the co_extra slot. */
-typedef struct {
-    int state;
-    Py_ssize_t calls;
-} JyCodeInfo;
-
-static struct {
-    Py_ssize_t functions_hooked;
-    Py_ssize_t codes_compiled;
-    Py_ssize_t codes_rejected;
-    Py_ssize_t jit_entries;
-    Py_ssize_t deopts;
-} stats;
-
-#define STAT_INC(name) _Py_atomic_add_ssize(&stats.name, 1)
 
 static int jy_enabled = 0;
 static int initialized = 0;
@@ -69,6 +41,11 @@ static PyObject *jy_vectorcall(PyObject *callable, PyObject *const *args,
 static void
 free_code_info(void *info)
 {
+    /* CPython calls this for every extra slot, including unset ones. */
+    if (info == NULL) {
+        return;
+    }
+    jy_jit_free(info);
     PyMem_RawFree(info);
 }
 
@@ -109,13 +86,18 @@ restore_default_vectorcall(PyFunctionObject *func)
     _Py_atomic_store_ptr_relaxed(&func->vectorcall, (void *)_PyFunction_Vectorcall);
 }
 
-/* Generate machine code for a code object. Returns 0 on success, -1 if the
- * code object is not supported. */
+/* Whether the code object contains a loop. Such code is compiled on its first
+ * call, since it may run for a long time. */
 static int
-jit_compile(PyCodeObject *co, JyCodeInfo *info)
+has_loop(PyCodeObject *co)
 {
-    (void)co;
-    (void)info;
+    for (int i = 0; i < Py_SIZE(co); i++) {
+        _Py_CODEUNIT cu = _Py_GetBaseCodeUnit(co, i);
+        if (cu.op.code == JUMP_BACKWARD) {
+            return 1;
+        }
+        i += _PyOpcode_Caches[cu.op.code];
+    }
     return 0;
 }
 
@@ -125,27 +107,18 @@ compile_code(PyCodeObject *co, JyCodeInfo *info)
     PyMutex_Lock(&compile_lock);
     int state = _Py_atomic_load_int_relaxed(&info->state);
     if (state == JY_WARMING) {
-        if (jit_compile(co, info) == 0) {
+        if (jy_jit_compile(co, info) == 0) {
             state = JY_COMPILED;
-            STAT_INC(codes_compiled);
+            JY_STAT_INC(codes_compiled);
         }
         else {
             state = JY_REJECTED;
-            STAT_INC(codes_rejected);
+            JY_STAT_INC(codes_rejected);
         }
         _Py_atomic_store_int_release(&info->state, state);
     }
     PyMutex_Unlock(&compile_lock);
     return state;
-}
-
-/* Hand the frame to the CPython interpreter, which continues at
- * frame->instr_ptr with the value stack ending at frame->stackpointer. */
-static PyObject *
-deopt(PyThreadState *tstate, _PyInterpreterFrame *frame)
-{
-    STAT_INC(deopts);
-    return _PyEval_EvalFrame(tstate, frame, 0);
 }
 
 /* Same as _PyEval_Vector (which is not exported), except that the frame is
@@ -154,7 +127,6 @@ static PyObject *
 jit_entry(PyFunctionObject *func, JyCodeInfo *info, PyObject *const *args,
           size_t nargsf, PyObject *kwnames)
 {
-    (void)info;
     PyThreadState *tstate = PyThreadState_GetUnchecked();
     size_t argcount = PyVectorcall_NARGS(nargsf);
     size_t total_args = argcount;
@@ -187,8 +159,7 @@ jit_entry(PyFunctionObject *func, JyCodeInfo *info, PyObject *const *args,
     if (frame == NULL) {
         return NULL;
     }
-    STAT_INC(jit_entries);
-    return deopt(tstate, frame);
+    return jy_run(tstate, frame, info->func);
 }
 
 static PyObject *
@@ -208,7 +179,8 @@ jy_vectorcall(PyObject *callable, PyObject *const *args, size_t nargsf,
     }
     int state = _Py_atomic_load_int_acquire(&info->state);
     if (state == JY_WARMING) {
-        if (_Py_atomic_add_ssize(&info->calls, 1) + 1 < jit_threshold) {
+        Py_ssize_t calls = _Py_atomic_add_ssize(&info->calls, 1) + 1;
+        if (calls < jit_threshold && !(calls == 1 && has_loop(co))) {
             return _PyFunction_Vectorcall(callable, args, nargsf, kwnames);
         }
         state = compile_code(co, info);
@@ -243,7 +215,7 @@ hook_function(PyFunctionObject *func, int created)
          * version has to be cleared as well. */
         PyFunction_SetVectorcall(func, jy_vectorcall);
     }
-    STAT_INC(functions_hooked);
+    JY_STAT_INC(functions_hooked);
     return 1;
 }
 
@@ -342,13 +314,14 @@ static PyObject *
 jyston_stats(PyObject *module, PyObject *Py_UNUSED(ignored))
 {
     return Py_BuildValue(
-        "{sn,sn,sn,sn,sn,sn}",
+        "{sn,sn,sn,sn,sn,sn,sn}",
         "jit_threshold", jit_threshold,
-        "functions_hooked", _Py_atomic_load_ssize_relaxed(&stats.functions_hooked),
-        "codes_compiled", _Py_atomic_load_ssize_relaxed(&stats.codes_compiled),
-        "codes_rejected", _Py_atomic_load_ssize_relaxed(&stats.codes_rejected),
-        "jit_entries", _Py_atomic_load_ssize_relaxed(&stats.jit_entries),
-        "deopts", _Py_atomic_load_ssize_relaxed(&stats.deopts));
+        "functions_hooked", _Py_atomic_load_ssize_relaxed(&jy_stats.functions_hooked),
+        "codes_compiled", _Py_atomic_load_ssize_relaxed(&jy_stats.codes_compiled),
+        "codes_rejected", _Py_atomic_load_ssize_relaxed(&jy_stats.codes_rejected),
+        "jit_entries", _Py_atomic_load_ssize_relaxed(&jy_stats.jit_entries),
+        "deopts", _Py_atomic_load_ssize_relaxed(&jy_stats.deopts),
+        "jit_errors", _Py_atomic_load_ssize_relaxed(&jy_stats.jit_errors));
 }
 
 static PyObject *
@@ -378,6 +351,24 @@ jyston_code_state(PyObject *module, PyObject *code)
     }
 }
 
+/* For debugging: the machine code generated for a code object. */
+static PyObject *
+jyston_machine_code(PyObject *module, PyObject *code)
+{
+    if (!PyCode_Check(code)) {
+        PyErr_SetString(PyExc_TypeError, "expected a code object");
+        return NULL;
+    }
+    JyCodeInfo *info = initialized ? get_code_info((PyCodeObject *)code, 0) : NULL;
+    if (info == NULL || _Py_atomic_load_int_acquire(&info->state) != JY_COMPILED) {
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+        Py_RETURN_NONE;
+    }
+    return PyBytes_FromStringAndSize(info->mem, (Py_ssize_t)info->mem_size);
+}
+
 static PyMethodDef jyston_methods[] = {
     {"enable", jyston_enable, METH_NOARGS, "Enable the JIT."},
     {"disable", jyston_disable, METH_NOARGS, "Disable the JIT."},
@@ -385,6 +376,8 @@ static PyMethodDef jyston_methods[] = {
     {"stats", jyston_stats, METH_NOARGS, "Return JIT statistics."},
     {"code_state", jyston_code_state, METH_O,
      "Return 'warming', 'compiled' or 'rejected' for a code object."},
+    {"_machine_code", jyston_machine_code, METH_O,
+     "Return the machine code generated for a code object, or None."},
     {NULL, NULL, 0, NULL},
 };
 

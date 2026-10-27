@@ -1,0 +1,986 @@
+/* x86-64 code generation, preprocessed by DynASM.
+ *
+ * Every bytecode instruction is translated to a fixed machine code sequence.
+ * The value stack lives in the frame like in the interpreter, but its depth at
+ * each instruction is computed at compile time, so stack slots are addressed
+ * with constant offsets from the frame pointer.
+ *
+ * Unsupported code objects are rejected as a whole and run by the interpreter.
+ * Within a compiled code object, rare cases jump to a deopt stub that hands
+ * the frame to the interpreter at the current instruction. Error stubs and
+ * other slow paths are emitted to a separate cold section.
+ */
+
+#include "jit.h"
+
+#include <sys/mman.h>
+
+#include "dynasm/dasm_proto.h"
+#include "dynasm/dasm_x86.h"
+
+|.arch x64
+|.section code, cold
+|.globals JYG_
+|.actionlist jy_actions
+
+|.define TSTATE, r13
+|.define FRAME, r12
+|.define BYTECODE, r14
+|.define EBVER, r15
+
+#define OFF_INSTR_PTR ((int)offsetof(_PyInterpreterFrame, instr_ptr))
+#define OFF_STACKPOINTER ((int)offsetof(_PyInterpreterFrame, stackpointer))
+#define OFF_LOCALSPLUS ((int)offsetof(_PyInterpreterFrame, localsplus))
+#define OFF_EVAL_BREAKER ((int)offsetof(PyThreadState, eval_breaker))
+#define OFF_OB_TYPE ((int)offsetof(PyObject, ob_type))
+#define OFF_LV_TAG ((int)offsetof(PyLongObject, long_value.lv_tag))
+#define OFF_DIGIT ((int)offsetof(PyLongObject, long_value.ob_digit))
+#define OFF_RANGE_START ((int)offsetof(_PyRangeIterObject, start))
+#define OFF_RANGE_STEP ((int)offsetof(_PyRangeIterObject, step))
+#define OFF_RANGE_LEN ((int)offsetof(_PyRangeIterObject, len))
+
+/* Compact ints have a tag below this, see _PyLong_IsCompact. */
+#define COMPACT_TAG_LIMIT (2 << _PyLong_NON_SIZE_BITS)
+
+_Static_assert(sizeof(digit) == 4, "expected 30 bit digits");
+_Static_assert(sizeof(long) == 8, "expected 64 bit longs");
+
+/* A decoded instruction. start is the index of the first code unit including
+ * EXTENDED_ARG prefixes, index is the index of the instruction itself. */
+typedef struct {
+    int start;
+    int index;
+    int next;
+    int opcode;
+    int oparg;
+} Instr;
+
+typedef struct {
+    dasm_State *d;
+    PyCodeObject *co;
+    int nlocalsplus;
+} Compiler;
+
+#define Dst (&c->d)
+
+static int
+local_off(Compiler *c, int i)
+{
+    return OFF_LOCALSPLUS + i * (int)sizeof(_PyStackRef);
+}
+
+static int
+stack_off(Compiler *c, int depth)
+{
+    return OFF_LOCALSPLUS + (c->nlocalsplus + depth) * (int)sizeof(_PyStackRef);
+}
+
+static void
+emit_call(Compiler *c, void *func)
+{
+    | mov64 rax, (uintptr_t)func
+    | call rax
+}
+
+/* Make the frame look like the interpreter is executing instruction index
+ * with depth items on the value stack. Clobbers rax. */
+static void
+emit_sync(Compiler *c, int index, int depth)
+{
+    int ip_off = index * (int)sizeof(_Py_CODEUNIT);
+    | lea rax, [BYTECODE + ip_off]
+    | mov [FRAME + OFF_INSTR_PTR], rax
+    | lea rax, [FRAME + stack_off(c, depth)]
+    | mov [FRAME + OFF_STACKPOINTER], rax
+}
+
+/* Increment the reference count of the stack reference in rax, if it is not
+ * deferred or tagged. Clobbers all caller saved registers except rax. */
+static void
+emit_dup_rax(Compiler *c)
+{
+    | test al, 1
+    | jnz >8
+#ifdef Py_GIL_DISABLED
+    | push rax
+    | sub rsp, 8
+    | mov rdi, rax
+    emit_call(c, (void *)jy_incref);
+    | add rsp, 8
+    | pop rax
+#else
+    /* Py_INCREF for 64-bit default builds. */
+    | mov ecx, [rax]
+    | cmp ecx, _Py_IMMORTAL_INITIAL_REFCNT
+    | jae >8
+    | inc ecx
+    | mov [rax], ecx
+#endif
+    |8:
+}
+
+/* Close the stack reference in rax. Destructors can run arbitrary code, so the
+ * frame is synced before calling them. */
+static void
+emit_close_rax(Compiler *c, int index, int depth)
+{
+    | test al, 1
+    | jnz >8
+#ifdef Py_GIL_DISABLED
+    | mov rdi, rax
+    emit_sync(c, index, depth);
+    emit_call(c, (void *)jy_decref);
+#else
+    /* Py_DECREF for 64-bit default builds. */
+    | mov ecx, [rax]
+    | test ecx, ecx
+    | js >8
+    | dec ecx
+    | mov [rax], ecx
+    | jz >7
+    |.cold
+    |7:
+    | mov rdi, rax
+    emit_sync(c, index, depth);
+    emit_call(c, (void *)_Py_Dealloc);
+    | jmp >8
+    |.code
+#endif
+    |8:
+}
+
+static void
+emit_error_stub(Compiler *c, int index, int depth)
+{
+    | mov rdi, TSTATE
+    | mov rsi, FRAME
+    | mov edx, index
+    | mov ecx, depth
+    emit_call(c, (void *)jy_error);
+    | jmp ->epilogue
+}
+
+static void
+emit_deopt_stub(Compiler *c, int start, int depth)
+{
+    | mov rdi, TSTATE
+    | mov rsi, FRAME
+    | mov edx, start
+    | mov ecx, depth
+    emit_call(c, (void *)jy_deopt);
+    | jmp ->epilogue
+}
+
+/* Branch to an error stub if eax is not zero. */
+static void
+emit_error_if_nonzero(Compiler *c, int index, int depth)
+{
+    | test eax, eax
+    | jnz >9
+    |.cold
+    |9:
+    emit_error_stub(c, index, depth);
+    |.code
+}
+
+static void
+emit_load_fast(Compiler *c, int local, int depth, int borrow)
+{
+    | mov rax, [FRAME + local_off(c, local)]
+    if (borrow) {
+        | or rax, 1
+        | mov [FRAME + stack_off(c, depth)], rax
+    }
+    else {
+        | mov [FRAME + stack_off(c, depth)], rax
+        emit_dup_rax(c);
+    }
+}
+
+/* Store the top of the stack (at depth - 1) into a local. */
+static void
+emit_store_fast(Compiler *c, Instr *in, int local, int depth)
+{
+    | mov rcx, [FRAME + stack_off(c, depth - 1)]
+    | mov rax, [FRAME + local_off(c, local)]
+    | mov [FRAME + local_off(c, local)], rcx
+    emit_close_rax(c, in->index, depth - 1);
+}
+
+static void
+emit_pop_jump_if_bool(Compiler *c, int target, int depth, PyObject *value)
+{
+    | mov rax, [FRAME + stack_off(c, depth - 1)]
+    | and rax, -2
+    | mov64 rcx, (uintptr_t)value
+    | cmp rax, rcx
+    | je =>target
+}
+
+/* Load the two operands at depth - 2 and depth - 1. If both are compact ints,
+ * leave their values in r8 and r9, otherwise jump to local label 5. */
+static void
+emit_load_compact_ints(Compiler *c, int depth)
+{
+    | mov rdi, [FRAME + stack_off(c, depth - 2)]
+    | and rdi, -2
+    | mov rsi, [FRAME + stack_off(c, depth - 1)]
+    | and rsi, -2
+    | mov64 rax, (uintptr_t)&PyLong_Type
+    | cmp [rdi + OFF_OB_TYPE], rax
+    | jne >5
+    | cmp [rsi + OFF_OB_TYPE], rax
+    | jne >5
+    | mov rax, [rdi + OFF_LV_TAG]
+    | cmp rax, COMPACT_TAG_LIMIT
+    | jae >5
+    | mov rcx, [rsi + OFF_LV_TAG]
+    | cmp rcx, COMPACT_TAG_LIMIT
+    | jae >5
+    /* value = (1 - (tag & 3)) * ob_digit[0], see _PyLong_CompactValue. */
+    | mov r8d, dword [rdi + OFF_DIGIT]
+    | and eax, 3
+    | mov edx, 1
+    | sub edx, eax
+    | movsxd rdx, edx
+    | imul r8, rdx
+    | mov r9d, dword [rsi + OFF_DIGIT]
+    | and ecx, 3
+    | mov edx, 1
+    | sub edx, ecx
+    | movsxd rdx, edx
+    | imul r9, rdx
+}
+
+/* Close the two operands at depth - 2 and depth - 1 and replace them with the
+ * result in rbx. */
+static void
+emit_replace_operands(Compiler *c, Instr *in, int depth)
+{
+    | mov rax, [FRAME + stack_off(c, depth - 2)]
+    emit_close_rax(c, in->index, depth - 2);
+    | mov rax, [FRAME + stack_off(c, depth - 1)]
+    emit_close_rax(c, in->index, depth - 2);
+    | mov [FRAME + stack_off(c, depth - 2)], rbx
+}
+
+/* The generic path of BINARY_OP and COMPARE_OP, emitted to the cold section
+ * at local label 5. Continues at local label 6. */
+static void
+emit_binary_generic(Compiler *c, Instr *in, int depth, void *helper)
+{
+    |.cold
+    |5:
+    emit_sync(c, in->index, depth);
+    | lea rdi, [FRAME + stack_off(c, depth - 2)]
+    | mov esi, in->oparg
+    emit_call(c, helper);
+    | test eax, eax
+    | jnz >9
+    | jmp >6
+    |9:
+    emit_error_stub(c, in->index, depth - 2);
+    |.code
+    |6:
+}
+
+static int
+is_inline_binary_op(int oparg)
+{
+    switch (oparg) {
+        case NB_ADD:
+        case NB_INPLACE_ADD:
+        case NB_SUBTRACT:
+        case NB_INPLACE_SUBTRACT:
+        case NB_MULTIPLY:
+        case NB_INPLACE_MULTIPLY:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static void
+emit_binary_op(Compiler *c, Instr *in, int depth)
+{
+    int oparg = in->oparg;
+    if (!is_inline_binary_op(oparg)) {
+        | jmp >5
+        emit_binary_generic(c, in, depth, (void *)jy_binary_op);
+        return;
+    }
+    /* Same as BINARY_OP_{ADD,SUBTRACT,MULTIPLY}_INT. Compact values have at
+     * most 30 bits, so the result can't overflow. */
+    emit_load_compact_ints(c, depth);
+    switch (oparg) {
+        case NB_ADD:
+        case NB_INPLACE_ADD:
+            | add r8, r9
+            break;
+        case NB_SUBTRACT:
+        case NB_INPLACE_SUBTRACT:
+            | sub r8, r9
+            break;
+        default:
+            | imul r8, r9
+            break;
+    }
+    emit_sync(c, in->index, depth);
+    | mov rdi, r8
+    emit_call(c, (void *)PyLong_FromLong);
+    | test rax, rax
+    | jz >9
+    |.cold
+    |9:
+    emit_error_stub(c, in->index, depth);
+    |.code
+    | mov rbx, rax
+    emit_replace_operands(c, in, depth);
+    emit_binary_generic(c, in, depth, (void *)jy_binary_op);
+}
+
+static void
+emit_compare_op(Compiler *c, Instr *in, int depth)
+{
+    /* Same as COMPARE_OP_INT, the low bits of oparg are a mask of the outcomes
+     * that are true. */
+    int mask = in->oparg & 14;
+    emit_load_compact_ints(c, depth);
+    | cmp r8, r9
+    switch (mask) {
+        case 2:
+            | jl >4
+            break;
+        case 4:
+            | jg >4
+            break;
+        case 6:
+            | jne >4
+            break;
+        case 8:
+            | je >4
+            break;
+        case 10:
+            | jle >4
+            break;
+        case 12:
+            | jge >4
+            break;
+        case 14:
+            | jmp >4
+            break;
+        default:
+            break;
+    }
+    | mov64 rbx, PyStackRef_False.bits
+    | jmp >3
+    |4:
+    | mov64 rbx, PyStackRef_True.bits
+    |3:
+    emit_replace_operands(c, in, depth);
+    emit_binary_generic(c, in, depth, (void *)jy_compare_op);
+}
+
+static void
+emit_for_iter(Compiler *c, Instr *in, int depth)
+{
+    int exit_target = in->next + in->oparg + 1;
+#ifndef Py_GIL_DISABLED
+    /* Same as FOR_ITER_RANGE. The free-threaded build also needs to check
+     * that the iterator is not shared, jy_for_iter does that. */
+    | mov rdi, [FRAME + stack_off(c, depth - 2)]
+    | and rdi, -2
+    | mov64 rax, (uintptr_t)&PyRangeIter_Type
+    | cmp [rdi + OFF_OB_TYPE], rax
+    | jne >5
+    | mov rax, [rdi + OFF_RANGE_LEN]
+    | test rax, rax
+    | jle =>exit_target
+    | dec rax
+    | mov [rdi + OFF_RANGE_LEN], rax
+    | mov rax, [rdi + OFF_RANGE_START]
+    | mov rcx, rax
+    | add rcx, [rdi + OFF_RANGE_STEP]
+    | mov [rdi + OFF_RANGE_START], rcx
+    | mov rbx, rax
+    emit_sync(c, in->index, depth);
+    | mov rdi, rbx
+    emit_call(c, (void *)PyLong_FromLong);
+    | test rax, rax
+    | jz >9
+    | mov [FRAME + stack_off(c, depth)], rax
+    |.cold
+    |9:
+    emit_error_stub(c, in->index, depth);
+    |5:
+#endif
+    emit_sync(c, in->index, depth);
+    | mov rdi, TSTATE
+    | mov rsi, FRAME
+    | lea rdx, [FRAME + stack_off(c, depth - 2)]
+    emit_call(c, (void *)jy_for_iter);
+    | test eax, eax
+    | jz =>exit_target
+    | js >9
+#ifndef Py_GIL_DISABLED
+    | jmp >6
+    |9:
+    emit_error_stub(c, in->index, depth);
+    |.code
+    |6:
+#else
+    |.cold
+    |9:
+    emit_error_stub(c, in->index, depth);
+    |.code
+#endif
+}
+
+/* Returns 0 on success, -1 if the instruction is not supported. */
+static int
+emit_instr(Compiler *c, Instr *in, int depth)
+{
+    int oparg = in->oparg;
+    PyObject *names = c->co->co_names;
+    switch (in->opcode) {
+        case NOP:
+        case NOT_TAKEN:
+        case RESUME:
+            /* jy_run checked the eval breaker and instrumentation. */
+            break;
+
+        case LOAD_FAST:
+            emit_load_fast(c, oparg, depth, 0);
+            break;
+        case LOAD_FAST_BORROW:
+            emit_load_fast(c, oparg, depth, 1);
+            break;
+        case LOAD_FAST_LOAD_FAST:
+            emit_load_fast(c, oparg >> 4, depth, 0);
+            emit_load_fast(c, oparg & 15, depth + 1, 0);
+            break;
+        case LOAD_FAST_BORROW_LOAD_FAST_BORROW:
+            emit_load_fast(c, oparg >> 4, depth, 1);
+            emit_load_fast(c, oparg & 15, depth + 1, 1);
+            break;
+        case LOAD_FAST_CHECK:
+            | mov rax, [FRAME + local_off(c, oparg)]
+            | cmp rax, 1
+            | je >9
+            |.cold
+            |9:
+            /* Let the interpreter raise the UnboundLocalError. */
+            emit_deopt_stub(c, in->start, depth);
+            |.code
+            | mov [FRAME + stack_off(c, depth)], rax
+            emit_dup_rax(c);
+            break;
+        case LOAD_FAST_AND_CLEAR:
+            | mov rax, [FRAME + local_off(c, oparg)]
+            | mov qword [FRAME + local_off(c, oparg)], 1
+            | mov [FRAME + stack_off(c, depth)], rax
+            break;
+        case STORE_FAST:
+            emit_store_fast(c, in, oparg, depth);
+            break;
+        case STORE_FAST_LOAD_FAST:
+            | mov rcx, [FRAME + stack_off(c, depth - 1)]
+            | mov rbx, [FRAME + local_off(c, oparg >> 4)]
+            | mov [FRAME + local_off(c, oparg >> 4)], rcx
+            | mov rax, [FRAME + local_off(c, oparg & 15)]
+            | mov [FRAME + stack_off(c, depth - 1)], rax
+            emit_dup_rax(c);
+            | mov rax, rbx
+            emit_close_rax(c, in->index, depth);
+            break;
+        case STORE_FAST_STORE_FAST:
+            emit_store_fast(c, in, oparg >> 4, depth);
+            emit_store_fast(c, in, oparg & 15, depth - 1);
+            break;
+        case LOAD_SMALL_INT: {
+            uintptr_t bits = (uintptr_t)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + oparg] | Py_TAG_REFCNT;
+            | mov64 rax, bits
+            | mov [FRAME + stack_off(c, depth)], rax
+            break;
+        }
+        case LOAD_CONST: {
+            uintptr_t bits = (uintptr_t)PyTuple_GET_ITEM(c->co->co_consts, oparg) | Py_TAG_REFCNT;
+            | mov64 rax, bits
+            | mov [FRAME + stack_off(c, depth)], rax
+            break;
+        }
+        case LOAD_COMMON_CONSTANT: {
+            PyObject *obj = PyInterpreterState_Get()->common_consts[oparg];
+            if (_Py_IsImmortal(obj)) {
+                uintptr_t bits = (uintptr_t)obj | Py_TAG_REFCNT;
+                | mov64 rax, bits
+                | mov [FRAME + stack_off(c, depth)], rax
+            }
+            else {
+                | mov64 rax, (uintptr_t)obj
+                | mov [FRAME + stack_off(c, depth)], rax
+                emit_dup_rax(c);
+            }
+            break;
+        }
+        case POP_TOP:
+        case END_FOR:
+            | mov rax, [FRAME + stack_off(c, depth - 1)]
+            emit_close_rax(c, in->index, depth - 1);
+            break;
+        case POP_ITER:
+            | mov rax, [FRAME + stack_off(c, depth - 2)]
+            emit_close_rax(c, in->index, depth - 2);
+            break;
+        case PUSH_NULL:
+            | mov qword [FRAME + stack_off(c, depth)], 1
+            break;
+        case COPY:
+            | mov rax, [FRAME + stack_off(c, depth - oparg)]
+            | mov [FRAME + stack_off(c, depth)], rax
+            emit_dup_rax(c);
+            break;
+        case SWAP:
+            | mov rax, [FRAME + stack_off(c, depth - 1)]
+            | mov rcx, [FRAME + stack_off(c, depth - oparg)]
+            | mov [FRAME + stack_off(c, depth - 1)], rcx
+            | mov [FRAME + stack_off(c, depth - oparg)], rax
+            break;
+
+        case JUMP_FORWARD:
+            | jmp =>(in->next + oparg)
+            break;
+        case JUMP_BACKWARD_NO_INTERRUPT:
+            | jmp =>(in->next - oparg)
+            break;
+        case JUMP_BACKWARD:
+#ifdef Py_GIL_DISABLED
+            | mov rdi, TSTATE
+            emit_call(c, (void *)jy_qsbr_quiescent);
+#endif
+            | cmp EBVER, [TSTATE + OFF_EVAL_BREAKER]
+            | jne >1
+            | jmp =>(in->next - oparg)
+            |.cold
+            |1:
+            emit_sync(c, in->index, depth);
+            | mov rdi, TSTATE
+            | mov rsi, EBVER
+            emit_call(c, (void *)jy_check_periodic);
+            | test eax, eax
+            | jz =>(in->next - oparg)
+            | js >9
+            /* The code object got instrumented. */
+            emit_deopt_stub(c, in->start, depth);
+            |9:
+            emit_error_stub(c, in->index, depth);
+            |.code
+            break;
+        case POP_JUMP_IF_FALSE:
+            emit_pop_jump_if_bool(c, in->next + oparg, depth, Py_False);
+            break;
+        case POP_JUMP_IF_TRUE:
+            emit_pop_jump_if_bool(c, in->next + oparg, depth, Py_True);
+            break;
+        case POP_JUMP_IF_NONE:
+        case POP_JUMP_IF_NOT_NONE:
+            | mov rax, [FRAME + stack_off(c, depth - 1)]
+            | mov rdx, rax
+            | and rdx, -2
+            | mov64 rcx, (uintptr_t)Py_None
+            | cmp rdx, rcx
+            if (in->opcode == POP_JUMP_IF_NONE) {
+                | je =>(in->next + oparg)
+                emit_close_rax(c, in->index, depth - 1);
+            }
+            else {
+                | je >1
+                emit_close_rax(c, in->index, depth - 1);
+                | jmp =>(in->next + oparg)
+                |1:
+            }
+            break;
+
+        case TO_BOOL:
+            | mov rax, [FRAME + stack_off(c, depth - 1)]
+            | and rax, -2
+            | mov64 rcx, (uintptr_t)Py_True
+            | cmp rax, rcx
+            | je >1
+            | mov64 rcx, (uintptr_t)Py_False
+            | cmp rax, rcx
+            | je >1
+            emit_sync(c, in->index, depth);
+            | lea rdi, [FRAME + stack_off(c, depth - 1)]
+            emit_call(c, (void *)jy_to_bool);
+            emit_error_if_nonzero(c, in->index, depth - 1);
+            |1:
+            break;
+        case BINARY_OP:
+            emit_binary_op(c, in, depth);
+            break;
+        case COMPARE_OP:
+            emit_compare_op(c, in, depth);
+            break;
+        case LOAD_GLOBAL:
+            emit_sync(c, in->index, depth);
+            | mov rdi, FRAME
+            | mov64 rsi, (uintptr_t)PyTuple_GET_ITEM(names, oparg >> 1)
+            | lea rdx, [FRAME + stack_off(c, depth)]
+            emit_call(c, (void *)jy_load_global);
+            emit_error_if_nonzero(c, in->index, depth);
+            if (oparg & 1) {
+                | mov qword [FRAME + stack_off(c, depth + 1)], 1
+            }
+            break;
+        case LOAD_ATTR: {
+            int method = oparg & 1;
+            emit_sync(c, in->index, depth);
+            | mov rdi, TSTATE
+            | lea rsi, [FRAME + stack_off(c, depth - 1)]
+            | mov64 rdx, (uintptr_t)PyTuple_GET_ITEM(names, oparg >> 1)
+            | mov ecx, method
+            emit_call(c, (void *)jy_load_attr);
+            emit_error_if_nonzero(c, in->index, depth - 1);
+            break;
+        }
+        case STORE_ATTR:
+            emit_sync(c, in->index, depth);
+            | lea rdi, [FRAME + stack_off(c, depth - 2)]
+            | mov64 rsi, (uintptr_t)PyTuple_GET_ITEM(names, oparg)
+            emit_call(c, (void *)jy_store_attr);
+            emit_error_if_nonzero(c, in->index, depth - 2);
+            break;
+        case STORE_SUBSCR:
+            emit_sync(c, in->index, depth);
+            | lea rdi, [FRAME + stack_off(c, depth - 3)]
+            emit_call(c, (void *)jy_store_subscr);
+            emit_error_if_nonzero(c, in->index, depth - 3);
+            break;
+        case BUILD_TUPLE:
+        case BUILD_LIST:
+            emit_sync(c, in->index, depth);
+            | lea rdi, [FRAME + stack_off(c, depth - oparg)]
+            | mov esi, oparg
+            emit_call(c, in->opcode == BUILD_TUPLE ? (void *)jy_build_tuple : (void *)jy_build_list);
+            emit_error_if_nonzero(c, in->index, depth);
+            break;
+        case GET_ITER:
+            emit_sync(c, in->index, depth);
+            | lea rdi, [FRAME + stack_off(c, depth - 1)]
+            | mov esi, oparg
+            emit_call(c, (void *)jy_get_iter);
+            emit_error_if_nonzero(c, in->index, depth - 1);
+            break;
+        case FOR_ITER:
+            emit_for_iter(c, in, depth);
+            break;
+        case CALL:
+            emit_sync(c, in->index, depth);
+            | mov rdi, TSTATE
+            | mov rsi, FRAME
+            | lea rdx, [FRAME + stack_off(c, depth - 2 - oparg)]
+            | mov ecx, oparg
+            emit_call(c, (void *)jy_call);
+            emit_error_if_nonzero(c, in->index, depth - 2 - oparg);
+            break;
+        case RETURN_VALUE:
+            | mov rdi, TSTATE
+            | mov rsi, FRAME
+            | mov rdx, [FRAME + stack_off(c, depth - 1)]
+            | mov ecx, in->index
+            emit_call(c, (void *)jy_return);
+            | jmp ->epilogue
+            break;
+
+        default:
+            return -1;
+    }
+    return 0;
+}
+
+/* Stack effect of a supported instruction for the fall through path, and its
+ * jump target (or -1) together with the stack depth there. Returns -1 if the
+ * instruction is not supported. */
+static int
+stack_effect(Instr *in, int depth, int *fallthrough, int *target, int *target_depth)
+{
+    int oparg = in->oparg;
+    int effect = 0;
+    *fallthrough = 1;
+    *target = -1;
+    *target_depth = 0;
+    switch (in->opcode) {
+        case NOP:
+        case NOT_TAKEN:
+        case RESUME:
+        case SWAP:
+        case STORE_FAST_LOAD_FAST:
+        case TO_BOOL:
+            effect = 0;
+            break;
+        case LOAD_FAST:
+        case LOAD_FAST_BORROW:
+        case LOAD_FAST_CHECK:
+        case LOAD_FAST_AND_CLEAR:
+        case LOAD_SMALL_INT:
+        case LOAD_CONST:
+        case LOAD_COMMON_CONSTANT:
+        case PUSH_NULL:
+        case COPY:
+        case GET_ITER:
+            effect = 1;
+            break;
+        case LOAD_FAST_LOAD_FAST:
+        case LOAD_FAST_BORROW_LOAD_FAST_BORROW:
+            effect = 2;
+            break;
+        case STORE_FAST:
+        case POP_TOP:
+        case END_FOR:
+        case BINARY_OP:
+        case COMPARE_OP:
+            effect = -1;
+            break;
+        case STORE_FAST_STORE_FAST:
+        case POP_ITER:
+        case STORE_ATTR:
+            effect = -2;
+            break;
+        case STORE_SUBSCR:
+            effect = -3;
+            break;
+        case LOAD_GLOBAL:
+            effect = 1 + (oparg & 1);
+            break;
+        case LOAD_ATTR:
+            effect = oparg & 1;
+            break;
+        case BUILD_TUPLE:
+        case BUILD_LIST:
+            effect = 1 - oparg;
+            break;
+        case CALL:
+            effect = -1 - oparg;
+            break;
+        case JUMP_FORWARD:
+            *fallthrough = 0;
+            *target = in->next + oparg;
+            break;
+        case JUMP_BACKWARD:
+        case JUMP_BACKWARD_NO_INTERRUPT:
+            *fallthrough = 0;
+            *target = in->next - oparg;
+            break;
+        case POP_JUMP_IF_FALSE:
+        case POP_JUMP_IF_TRUE:
+        case POP_JUMP_IF_NONE:
+        case POP_JUMP_IF_NOT_NONE:
+            effect = -1;
+            *target = in->next + oparg;
+            break;
+        case FOR_ITER:
+            effect = 1;
+            *target = in->next + oparg + 1;
+            break;
+        case RETURN_VALUE:
+            effect = -1;
+            *fallthrough = 0;
+            break;
+        default:
+            return -1;
+    }
+    *target_depth = depth + (in->opcode == FOR_ITER ? 0 : effect);
+    return depth + effect;
+}
+
+/* Decode the code object into instrs, indexed by the start of each
+ * instruction. Other entries have start == -1. */
+static int
+decode(PyCodeObject *co, Instr *instrs, int n)
+{
+    for (int i = 0; i < n; i++) {
+        instrs[i].start = -1;
+    }
+    int i = 0;
+    while (i < n) {
+        int start = i;
+        int oparg = 0;
+        _Py_CODEUNIT cu;
+        for (;;) {
+            cu = _Py_GetBaseCodeUnit(co, i);
+            oparg = (oparg << 8) | cu.op.arg;
+            if (cu.op.code != EXTENDED_ARG) {
+                break;
+            }
+            if (++i >= n) {
+                return -1;
+            }
+        }
+        Instr *in = &instrs[start];
+        in->start = start;
+        in->index = i;
+        in->opcode = cu.op.code;
+        in->oparg = oparg;
+        in->next = i + 1 + _PyOpcode_Caches[cu.op.code];
+        i = in->next;
+    }
+    return 0;
+}
+
+/* Compute the stack depth at the start of every reachable instruction.
+ * Unreachable instructions get -1. */
+static int
+compute_depths(Instr *instrs, int *depths, int n, int max_depth)
+{
+    int *worklist = PyMem_RawMalloc(sizeof(int) * (n + 1));
+    if (worklist == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        depths[i] = -1;
+    }
+    int top = 0;
+    depths[0] = 0;
+    worklist[top++] = 0;
+    int ok = 1;
+    while (top > 0 && ok) {
+        int s = worklist[--top];
+        Instr *in = &instrs[s];
+        int fallthrough, target, target_depth;
+        int depth = stack_effect(in, depths[s], &fallthrough, &target, &target_depth);
+        if (depth < 0 || depth > max_depth || target_depth < 0 || target_depth > max_depth) {
+            ok = 0;
+            break;
+        }
+        int succ[2] = {fallthrough ? in->next : -1, target};
+        int succ_depth[2] = {depth, target_depth};
+        for (int k = 0; k < 2; k++) {
+            int t = succ[k];
+            if (t < 0) {
+                continue;
+            }
+            if (t >= n || instrs[t].start != t) {
+                ok = 0;
+                break;
+            }
+            if (depths[t] == -1) {
+                depths[t] = succ_depth[k];
+                worklist[top++] = t;
+            }
+            else if (depths[t] != succ_depth[k]) {
+                ok = 0;
+                break;
+            }
+        }
+    }
+    PyMem_RawFree(worklist);
+    return ok ? 0 : -1;
+}
+
+static int
+generate(Compiler *c, Instr *instrs, int *depths, int n, JyCodeInfo *info)
+{
+    void *labels[JYG__MAX];
+    dasm_init(Dst, DASM_MAXSECTION);
+    dasm_setupglobal(Dst, labels, JYG__MAX);
+    dasm_setup(Dst, jy_actions);
+    dasm_growpc(Dst, n);
+
+    |.code
+    |->entry:
+    | push rbp
+    | push rbx
+    | push r12
+    | push r13
+    | push r14
+    | push r15
+    | sub rsp, 8
+    | mov TSTATE, rdi
+    | mov FRAME, rsi
+    | mov BYTECODE, rdx
+    | mov EBVER, rcx
+
+    for (int i = 0; i < n; i++) {
+        if (instrs[i].start != i || depths[i] < 0) {
+            continue;
+        }
+        |=>i:
+        if (emit_instr(c, &instrs[i], depths[i]) < 0) {
+            dasm_free(Dst);
+            return -1;
+        }
+    }
+
+    |->epilogue:
+    | add rsp, 8
+    | pop r15
+    | pop r14
+    | pop r13
+    | pop r12
+    | pop rbx
+    | pop rbp
+    | ret
+
+    size_t size;
+    if (dasm_link(Dst, &size) != DASM_S_OK) {
+        dasm_free(Dst);
+        return -1;
+    }
+    void *mem = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        dasm_free(Dst);
+        return -1;
+    }
+    if (dasm_encode(Dst, mem) != DASM_S_OK ||
+            mprotect(mem, size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(mem, size);
+        dasm_free(Dst);
+        return -1;
+    }
+    dasm_free(Dst);
+    info->mem = mem;
+    info->mem_size = size;
+    info->func = (JyJitFunc)labels[JYG_entry];
+    return 0;
+}
+
+int
+jy_jit_compile(PyCodeObject *co, JyCodeInfo *info)
+{
+    if (co->co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) {
+        return -1;
+    }
+    if (PyBytes_GET_SIZE(co->co_exceptiontable) > 0) {
+        return -1;
+    }
+    int n = (int)Py_SIZE(co);
+    Instr *instrs = PyMem_RawMalloc(sizeof(Instr) * n);
+    int *depths = PyMem_RawMalloc(sizeof(int) * n);
+    int res = -1;
+    if (instrs == NULL || depths == NULL) {
+        goto done;
+    }
+    if (decode(co, instrs, n) < 0) {
+        goto done;
+    }
+    if (compute_depths(instrs, depths, n, co->co_stacksize) < 0) {
+        goto done;
+    }
+    Compiler compiler = {.d = NULL, .co = co, .nlocalsplus = co->co_nlocalsplus};
+    res = generate(&compiler, instrs, depths, n, info);
+done:
+    PyMem_RawFree(instrs);
+    PyMem_RawFree(depths);
+    return res;
+}
+
+void
+jy_jit_free(JyCodeInfo *info)
+{
+    if (info->mem != NULL) {
+        munmap(info->mem, info->mem_size);
+        info->mem = NULL;
+    }
+}

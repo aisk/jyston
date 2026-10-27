@@ -2,11 +2,11 @@
 
 Jyston is a fork of [Pyston](https://github.com/pyston/pyston), or more precisely of Pyston lite, the JIT part of Pyston packaged as an extension module for stock CPython.
 
-The goal is a JIT for CPython 3.15, including free-threaded builds, that works on CPython's bytecode and specialized instructions directly and does not depend on CPython's own tier 2 / copy-and-patch JIT. It is at an early stage: the entry hook and deoptimization path are in place, but no machine code is generated yet.
+The goal is a JIT for CPython 3.15, including free-threaded builds, that works on CPython's bytecode and specialized instructions directly and does not depend on CPython's own tier 2 / copy-and-patch JIT. It is at an early stage: machine code is generated for x86-64 only, and only for code objects that use a small set of instructions and have no exception handlers. Generators, coroutines and everything else run in the CPython interpreter.
 
 ## How it works
 
-Instead of a PEP 523 frame evaluation hook, which disables inlined Python-to-Python calls for the whole interpreter, jyston replaces the vectorcall slot of individual function objects. Calls are counted per code object, and hot code objects are compiled. Compiled code runs on CPython's own `_PyInterpreterFrame`, and deoptimizes by writing its state back into the frame and letting the CPython interpreter continue from that instruction.
+Instead of a PEP 523 frame evaluation hook, which disables inlined Python-to-Python calls for the whole interpreter, jyston replaces the vectorcall slot of individual function objects. Calls are counted per code object, and hot code objects (or code objects with a loop, on their first call) are compiled with [DynASM](https://luajit.org/dynasm.html). Compiled code runs on CPython's own `_PyInterpreterFrame`, and deoptimizes by writing its state back into the frame and letting the CPython interpreter continue from that instruction.
 
 ## Building
 
@@ -14,7 +14,7 @@ Instead of a PEP 523 frame evaluation hook, which disables inlined Python-to-Pyt
 PYTHON=python3.15 make
 ```
 
-This creates a virtualenv in `env/` and installs `jyston` together with a `.pth` file that enables it on interpreter startup. Set `JYSTON_DISABLE=1` to turn it off at runtime, and `JYSTON_JIT_THRESHOLD` to change the number of calls before a function is compiled (default 100). `jyston.stats()` returns some counters.
+Building on x86-64 needs `luajit` (to run DynASM) and the `LuaJIT` submodule. This creates a virtualenv in `env/` and installs `jyston` together with a `.pth` file that enables it on interpreter startup. Set `JYSTON_DISABLE=1` to turn it off at runtime, and `JYSTON_JIT_THRESHOLD` to change the number of calls before a function is compiled (default 100). `jyston.stats()` returns some counters.
 
 ## Testing
 

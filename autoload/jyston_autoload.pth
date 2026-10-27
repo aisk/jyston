@@ -1,1 +1,1 @@
-import os, sys; exec("""("JYSTON_DISABLE" not in os.environ) and __import__("jyston").enable()""")
+import os, sys; exec("if 'JYSTON_DISABLE' not in os.environ:\n try:\n  __import__('jyston').enable()\n except ImportError:\n  pass  # e.g. in subinterpreters, which jyston does not support")
