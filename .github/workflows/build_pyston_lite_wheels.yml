@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v2
       - name: checkout submodules
         run: |
-          git submodule update --init pyston/LuaJIT
+          git submodule update --init LuaJIT
 
       - name: install macOS dependencies
         run: |
@@ -20,13 +20,12 @@ jobs:
 
       - name: Build wheels
         run: |
-          cd pyston/pyston_lite
           PYSTON_LITE_NAME=pyston_lite make build_wheels_noclean
           PYSTON_LITE_NAME=pyston      make build_wheels_noclean
 
       - uses: actions/upload-artifact@v2
         with:
-          path: ./pyston/pyston_lite/wheelhouse/
+          path: ./wheelhouse/
 
   build_pyston_lite_wheels_linux:
     name: Building wheels on Linux
@@ -35,11 +34,7 @@ jobs:
       - uses: actions/checkout@v2
       - name: checkout submodules
         run: |
-          git submodule update --init pyston/LuaJIT pyston/bolt
-
-      - name: build BOLT
-        run: |
-          make bolt -j`nproc`
+          git submodule update --init LuaJIT
 
       - name: install Python versions
         run: |
@@ -48,11 +43,13 @@ jobs:
           sudo apt-get install -y python3.*-full
 
       - name: Build wheels
+        env:
+          # llvm-bolt is not available here
+          NOBOLT: "1"
         run: |
-          cd pyston/pyston_lite
           PYSTON_LITE_NAME=pyston_lite make build_wheels_noclean
           PYSTON_LITE_NAME=pyston      make build_wheels_noclean
 
       - uses: actions/upload-artifact@v2
         with:
-          path: ./pyston/pyston_lite/wheelhouse/
+          path: ./wheelhouse/

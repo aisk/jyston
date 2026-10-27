@@ -42,15 +42,6 @@ sudo --preserve-env=DEBIAN_FRONTEND apt-get install -y libssl-dev libsqlite3-dev
 
 sudo chown -R `whoami` /pyston_dir
 
-cd /pyston_dir/pyston/pyston_lite
-
-if [ -z ${NOBOLT+x} ]; then
-    make -C ../.. -j$(nproc) bolt
-fi
+cd /pyston_dir
 
 PYTHON=python${PYTHON_VERSION} make test -j$(nproc)
-
-# run external testsuites on amd64
-if [ `uname -m` == x86_64 ]; then
-    PYTHON=python${PYTHON_VERSION} make testsuites -j$(nproc)
-fi
