@@ -1,4 +1,4 @@
-name: Build pyston_lite wheels
+name: Build legacy pyston_lite wheels
 
 on: [workflow_dispatch]
 
@@ -19,6 +19,7 @@ jobs:
           echo "CC=gcc-11" >> $GITHUB_ENV
 
       - name: Build wheels
+        working-directory: legacy
         run: |
           PYSTON_LITE_NAME=pyston_lite make build_wheels_noclean
           PYSTON_LITE_NAME=pyston      make build_wheels_noclean
@@ -26,7 +27,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos
-          path: ./wheelhouse/
+          path: ./legacy/wheelhouse/
 
   build_pyston_lite_wheels_linux:
     name: Building wheels on Linux
@@ -47,6 +48,7 @@ jobs:
         env:
           # llvm-bolt is not available here
           NOBOLT: "1"
+        working-directory: legacy
         run: |
           PYSTON_LITE_NAME=pyston_lite make build_wheels_noclean
           PYSTON_LITE_NAME=pyston      make build_wheels_noclean
@@ -54,4 +56,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux
-          path: ./wheelhouse/
+          path: ./legacy/wheelhouse/

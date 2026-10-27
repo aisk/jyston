@@ -11,3 +11,4 @@ wheelhouse/
 *.gen.c
 *.gcda
 perf*.data*
+envt/

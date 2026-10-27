@@ -5,9 +5,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        python-version: ["3.15", "3.15t"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: build and test
+        run: PYTHON=python make test
+
+  legacy:
+    strategy:
+      fail-fast: false
+      matrix:
         os: [ubuntu-22.04, ubuntu-22.04-arm]
         python-version: ["3.8", "3.9", "3.10"]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: legacy
     steps:
       - uses: actions/checkout@v4
         with:

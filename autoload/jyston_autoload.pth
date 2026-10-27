@@ -1,0 +1,1 @@
+import os, sys; exec("""("JYSTON_DISABLE" not in os.environ) and __import__("jyston").enable()""")
