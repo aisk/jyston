@@ -1,8 +1,8 @@
-# Pyston lite
+# Jyston
 
-Pyston lite is the JIT part of [Pyston](https://github.com/pyston/pyston), packaged as an extension module for stock CPython. It supports Python 3.7, 3.8, 3.9 and 3.10, and is compatible with existing binary packages.
+Jyston is a fork of [Pyston](https://github.com/pyston/pyston), or more precisely of Pyston lite, the JIT part of Pyston packaged as an extension module for stock CPython. It supports Python 3.8, 3.9 and 3.10, and is compatible with existing binary packages.
 
-This repository only contains the pyston-lite sources, stripped out of the Pyston repository.
+Only the pyston-lite sources are kept here, everything else from the Pyston repository has been removed. The module and package names are still `pyston_lite` and `pyston_lite_autoload`.
 
 ## Building
 
